@@ -1,6 +1,6 @@
 /*
- * Copyright 2011-2017 Branimir Karadzic. All rights reserved.
- * License: https://github.com/bkaradzic/bgfx#license-bsd-2-clause
+ * Copyright 2011-2018 Branimir Karadzic. All rights reserved.
+ * License: https://github.com/bkaradzic/bimg#license-bsd-2-clause
  */
 
 #include <bimg/encode.h>
@@ -12,6 +12,7 @@
 #include <nvtt/nvtt.h>
 #include <pvrtc/PvrTcEncoder.h>
 #include <edtaa3/edtaa3func.h>
+#include <astc/astc_lib.h>
 
 BX_PRAGMA_DIAGNOSTIC_PUSH();
 BX_PRAGMA_DIAGNOSTIC_IGNORED_MSVC(4100) // warning C4100: 'alloc_context': unreferenced formal parameter
@@ -35,7 +36,15 @@ namespace bimg
 	};
 	BX_STATIC_ASSERT(Quality::Count == BX_COUNTOF(s_squishQuality) );
 
-	void imageEncodeFromRgba8(void* _dst, const void* _src, uint32_t _width, uint32_t _height, uint32_t _depth, TextureFormat::Enum _format, Quality::Enum _quality, bx::Error* _err)
+    static const ASTC_COMPRESS_MODE s_astcQuality[] =
+    {
+        ASTC_COMPRESS_MEDIUM,       // Default
+        ASTC_COMPRESS_THOROUGH,     // Highest
+        ASTC_COMPRESS_FAST,         // Fastest
+    };
+    BX_STATIC_ASSERT(Quality::Count == BX_COUNTOF(s_astcQuality));
+
+	void imageEncodeFromRgba8(bx::AllocatorI* _allocator, void* _dst, const void* _src, uint32_t _width, uint32_t _height, uint32_t _depth, TextureFormat::Enum _format, Quality::Enum _quality, bx::Error* _err)
 	{
 		const uint8_t* src = (const uint8_t*)_src;
 		uint8_t* dst = (uint8_t*)_dst;
@@ -122,6 +131,22 @@ namespace bimg
 				}
 				break;
 
+			case TextureFormat::ASTC4x4:
+			case TextureFormat::ASTC5x5:
+			case TextureFormat::ASTC6x6:
+			case TextureFormat::ASTC8x5:
+			case TextureFormat::ASTC8x6:
+			case TextureFormat::ASTC10x5:
+				{
+                    const bimg::ImageBlockInfo& astcBlockInfo = bimg::getBlockInfo(_format);
+
+                    ASTC_COMPRESS_MODE  compress_mode = s_astcQuality[_quality];
+					ASTC_DECODE_MODE    decode_mode   = ASTC_DECODE_LDR_LINEAR;
+
+                    astc_compress(_width, _height, src, ASTC_RGBA, srcPitch, astcBlockInfo.blockWidth, astcBlockInfo.blockHeight, compress_mode, decode_mode, dst);
+				}
+				break;
+
 			case TextureFormat::BGRA8:
 				imageSwizzleBgra8(dst, dstPitch, _width, _height, src, srcPitch);
 				break;
@@ -131,7 +156,7 @@ namespace bimg
 				break;
 
 			default:
-				if (!imageConvert(dst, _format, src, TextureFormat::RGBA8, _width, _height, 1) )
+				if (!imageConvert(_allocator, dst, _format, src, TextureFormat::RGBA8, _width, _height, 1) )
 				{
 					BX_ERROR_SET(_err, BIMG_ERROR, "Unable to convert between input/output formats!");
 				}
@@ -157,10 +182,10 @@ namespace bimg
 			break;
 
 		default:
-			if (!imageConvert(_dst, _dstFormat, _src, TextureFormat::RGBA32F, _width, _height, _depth) )
+			if (!imageConvert(_allocator, _dst, _dstFormat, _src, TextureFormat::RGBA32F, _width, _height, _depth) )
 			{
 				uint8_t* temp = (uint8_t*)BX_ALLOC(_allocator, _width*_height*_depth*4);
-				if (imageConvert(temp, TextureFormat::RGBA8, _src, TextureFormat::RGBA32F, _width, _height, _depth) )
+				if (imageConvert(_allocator, temp, TextureFormat::RGBA8, _src, TextureFormat::RGBA32F, _width, _height, _depth) )
 				{
 					for (uint32_t zz = 0; zz < _depth; ++zz)
 					{
@@ -175,15 +200,15 @@ namespace bimg
 								const uint32_t offset = yoffset + xx;
 								const float* input = (const float*)&src[offset * 16];
 								uint8_t* output    = &temp[offset * 4];
-								output[0] = uint8_t(bx::fsaturate(input[0])*255.0f + 0.5f);
-								output[1] = uint8_t(bx::fsaturate(input[1])*255.0f + 0.5f);
-								output[2] = uint8_t(bx::fsaturate(input[2])*255.0f + 0.5f);
-								output[3] = uint8_t(bx::fsaturate(input[3])*255.0f + 0.5f);
+								output[0] = uint8_t(bx::clamp(input[0], 0.0f, 1.0f)*255.0f + 0.5f);
+								output[1] = uint8_t(bx::clamp(input[1], 0.0f, 1.0f)*255.0f + 0.5f);
+								output[2] = uint8_t(bx::clamp(input[2], 0.0f, 1.0f)*255.0f + 0.5f);
+								output[3] = uint8_t(bx::clamp(input[3], 0.0f, 1.0f)*255.0f + 0.5f);
 							}
 						}
 					}
 
-					imageEncodeFromRgba8(_dst, temp, _width, _height, _depth, _dstFormat, _quality, _err);
+					imageEncodeFromRgba8(_allocator, _dst, temp, _width, _height, _depth, _dstFormat, _quality, _err);
 				}
 				else
 				{
@@ -194,6 +219,104 @@ namespace bimg
 			}
 			break;
 		}
+	}
+
+	void imageEncode(bx::AllocatorI* _allocator, void* _dst, const void* _src, TextureFormat::Enum _srcFormat, uint32_t _width, uint32_t _height, uint32_t _depth, TextureFormat::Enum _dstFormat, Quality::Enum _quality, bx::Error* _err)
+	{
+		switch (_dstFormat)
+		{
+			case TextureFormat::BC1:
+			case TextureFormat::BC2:
+			case TextureFormat::BC3:
+			case TextureFormat::BC4:
+			case TextureFormat::BC5:
+			case TextureFormat::ETC1:
+			case TextureFormat::ETC2:
+			case TextureFormat::PTC14:
+			case TextureFormat::PTC14A:
+			case TextureFormat::ASTC4x4:
+			case TextureFormat::ASTC5x5:
+			case TextureFormat::ASTC6x6:
+			case TextureFormat::ASTC8x5:
+			case TextureFormat::ASTC8x6:
+			case TextureFormat::ASTC10x5:
+				{
+					uint8_t* temp = (uint8_t*)BX_ALLOC(_allocator, _width*_height*_depth*4);
+					imageDecodeToRgba8(_allocator, temp, _src, _width, _height, _width*4, _srcFormat);
+					imageEncodeFromRgba8(_allocator, _dst, temp, _width, _height, _depth, _dstFormat, _quality, _err);
+					BX_FREE(_allocator, temp);
+				}
+				break;
+
+			case bimg::TextureFormat::BC6H:
+			case bimg::TextureFormat::BC7:
+				{
+					uint8_t* temp = (uint8_t*)BX_ALLOC(_allocator, _width*_height*_depth*16);
+					imageDecodeToRgba32f(_allocator, temp, _src, _width, _height, _depth, _width*16, _srcFormat);
+					imageEncodeFromRgba32f(_allocator, _dst, temp, _width, _height, _depth, _dstFormat, _quality, _err);
+					BX_FREE(_allocator, temp);
+				}
+				break;
+
+			default:
+				if (!imageConvert(_allocator, _dst, _dstFormat, _src, _srcFormat, _width, _height, 1) )
+				{
+					BX_ERROR_SET(_err, BIMG_ERROR, "Unable to convert between input/output formats!");
+				}
+				break;
+		}
+	}
+
+	ImageContainer* imageEncode(bx::AllocatorI* _allocator, TextureFormat::Enum _dstFormat, Quality::Enum _quality, const ImageContainer& _input)
+	{
+		ImageContainer* output = imageAlloc(_allocator
+			, _dstFormat
+			, uint16_t(_input.m_width)
+			, uint16_t(_input.m_height)
+			, uint16_t(_input.m_depth)
+			, _input.m_numLayers
+			, _input.m_cubeMap
+			, 1 < _input.m_numMips
+			);
+
+		const uint16_t numSides = _input.m_numLayers * (_input.m_cubeMap ? 6 : 1);
+
+		bx::Error err;
+
+		for (uint16_t side = 0; side < numSides && err.isOk(); ++side)
+		{
+			for (uint8_t lod = 0, num = _input.m_numMips; lod < num && err.isOk(); ++lod)
+			{
+				ImageMip mip;
+				if (imageGetRawData(_input, side, lod, _input.m_data, _input.m_size, mip) )
+				{
+					ImageMip dstMip;
+					imageGetRawData(*output, side, lod, output->m_data, output->m_size, dstMip);
+					uint8_t* dstData = const_cast<uint8_t*>(dstMip.m_data);
+
+					imageEncode(
+						  _allocator
+						, dstData
+						, mip.m_data
+						, mip.m_format
+						, mip.m_width
+						, mip.m_height
+						, mip.m_depth
+						, _dstFormat
+						, _quality
+						, &err
+						);
+				}
+			}
+		}
+
+		if (err.isOk() )
+		{
+			return output;
+		}
+
+		imageFree(output);
+		return NULL;
 	}
 
 	void imageRgba32f11to01(void* _dst, uint32_t _width, uint32_t _height, uint32_t _depth, uint32_t _pitch, const void* _src)
@@ -245,21 +368,6 @@ namespace bimg
 		BX_FREE(_allocator, gy);
 	}
 
-	inline double min(double _a, double _b)
-	{
-		return _a > _b ? _b : _a;
-	}
-
-	inline double max(double _a, double _b)
-	{
-		return _a > _b ? _a : _b;
-	}
-
-	inline double clamp(double _val, double _min, double _max)
-	{
-		return max(min(_val, _max), _min);
-	}
-
 	void imageMakeDist(bx::AllocatorI* _allocator, void* _dst, uint32_t _width, uint32_t _height, uint32_t _srcPitch, float _edge, const void* _src)
 	{
 		const uint32_t numPixels = _width*_height;
@@ -296,7 +404,7 @@ namespace bimg
 
 		for (uint32_t ii = 0; ii < numPixels; ++ii)
 		{
-			double dist = clamp( ( (outside[ii] - inside[ii])+edgeOffset) * invEdge, 0.0, 1.0);
+			double dist = bx::clamp( ( (outside[ii] - inside[ii])+edgeOffset) * invEdge, 0.0, 1.0);
 			dst[ii] = 255-uint8_t(dist * 255.0);
 		}
 
@@ -341,27 +449,38 @@ namespace bimg
 		{
 			bimg::ImageMip srcMip;
 			bimg::imageGetRawData(*_src, side, 0, _src->m_data, _src->m_size, srcMip);
-			const float* srcData = (const float*)(srcMip.m_data);
 
 			bimg::ImageMip dstMip;
 			bimg::imageGetRawData(*_dst, side, 0, _dst->m_data, _dst->m_size, dstMip);
-			float* dstData = (float*)(dstMip.m_data);
+			uint8_t* dstData = const_cast<uint8_t*>(dstMip.m_data);
 
-			int result = stbir_resize_float_generic(
-				  (const float*)srcData, _src->m_width, _src->m_height, _src->m_width*16
-				, (      float*)dstData, _dst->m_width, _dst->m_height, _dst->m_width*16
-				, 4, 3
-				, STBIR_FLAG_ALPHA_PREMULTIPLIED
-				, STBIR_EDGE_CLAMP
-				, STBIR_FILTER_DEFAULT
-				, STBIR_COLORSPACE_LINEAR
-				, NULL
-				);
+			const uint32_t srcPitch = _src->m_width*16;
+			const uint32_t srcSlice = _src->m_height*srcPitch;
+			const uint32_t dstPitch = _dst->m_width*16;
+			const uint32_t dstSlice = _dst->m_height*dstPitch;
 
-			if (1 != result)
+			for (uint32_t zz = 0, depth = _dst->m_depth; zz < depth; ++zz, dstData += dstSlice)
 			{
-				return false;
+				const uint32_t srcDataStep = uint32_t(bx::floor(zz * _src->m_depth / float(_dst->m_depth) ) );
+				const uint8_t* srcData = &srcMip.m_data[srcDataStep*srcSlice];
+
+				int result = stbir_resize_float_generic(
+					  (const float*)srcData, _src->m_width, _src->m_height, srcPitch
+					, (      float*)dstData, _dst->m_width, _dst->m_height, dstPitch
+					, 4, 3
+					, STBIR_FLAG_ALPHA_PREMULTIPLIED
+					, STBIR_EDGE_CLAMP
+					, STBIR_FILTER_CUBICBSPLINE
+					, STBIR_COLORSPACE_LINEAR
+					, NULL
+					);
+
+				if (1 != result)
+				{
+					return false;
+				}
 			}
+
 		}
 
 		return true;
@@ -472,7 +591,7 @@ namespace bimg
 			{
 				float rgba[4];
 				unpack(rgba, data);
-				rgba[3] = bx::fsaturate(rgba[3]*scale);
+				rgba[3] = bx::clamp(rgba[3]*scale, 0.0f, 1.0f);
 				pack(data, rgba);
 			}
 		}
